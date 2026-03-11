@@ -1,0 +1,7 @@
+syntax = "proto3";
+package smartchoices;
+option go_package = "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/stubs/smartchoices";
+
+message FeedbackId {
+  bytes id = 1;
+}

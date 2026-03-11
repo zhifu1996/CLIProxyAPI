@@ -1,0 +1,11 @@
+syntax = "proto3";
+package google.rpc;
+option go_package = "google.golang.org/genproto/googleapis/rpc/errdetails;errdetails";
+
+message Help {
+  message Link {
+    string description = 1;
+    string url = 2;
+  }
+  repeated Link links = 1;
+}

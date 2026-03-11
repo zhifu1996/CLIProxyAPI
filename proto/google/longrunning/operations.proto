@@ -1,0 +1,18 @@
+syntax = "proto3";
+package google.longrunning;
+option go_package = "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/stubs/longrunning";
+
+import "google/protobuf/any.proto";
+
+message Operation {
+  string name = 1;
+  google.protobuf.Any metadata = 2;
+  bool done = 3;
+  oneof result {
+    google.protobuf.Any response = 5;
+  }
+}
+
+message GetOperationRequest {
+  string name = 1;
+}

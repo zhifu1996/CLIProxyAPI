@@ -1,0 +1,72 @@
+syntax = "proto3";
+package google.internal.cloud.code.v1internal;
+option go_package = "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/v1internal";
+
+import "google/internal/cloud/code/v1internal/model_configs.proto";
+import "google/internal/cloud/code/v1internal/credits.proto";
+import "google/internal/cloud/code/v1internal/remote_context.proto";
+import "google/cloud/aiplatform/master/tool.proto";
+import "google/protobuf/timestamp.proto";
+
+message GenerateContentRequest {
+  string project = 1;
+  string request_id = 2;
+  google.cloud.aiplatform.master.GenerateContentRequest request = 3;
+  string model = 4;
+  string user_prompt_id = 5;
+  string user_agent = 6;
+  string request_type = 7;
+  repeated google.internal.cloud.code.v1internal.Credits.CreditType enabled_credit_types = 8;
+}
+
+message GenerateContentResponse {
+  message Metadata {
+    google.internal.cloud.code.v1internal.RemoteContext remote_context = 1;
+  }
+
+  google.cloud.aiplatform.master.GenerateContentResponse response = 1;
+  string trace_id = 2;
+  repeated google.internal.cloud.code.v1internal.Credits consumed_credits = 3;
+  repeated google.internal.cloud.code.v1internal.Credits remaining_credits = 4;
+  google.internal.cloud.code.v1internal.GenerateContentResponse.Metadata metadata = 5;
+}
+
+message CountTokensRequest {
+  google.cloud.aiplatform.master.CountTokensRequest request = 1;
+}
+
+message CountTokensResponse {
+  int32 total_tokens = 1;
+}
+
+message RetrieveUserQuotaRequest {
+  string project = 1;
+}
+
+message RetrieveUserQuotaResponse {
+  enum TokenType {
+    TOKEN_TYPE_UNSPECIFIED = 0;
+    REQUESTS = 1;
+    WTUS = 2;
+  }
+
+  message BucketInfo {
+    oneof remaining {
+      int64 remaining_amount = 1;
+      float remaining_fraction = 5;
+    }
+    google.protobuf.Timestamp reset_time = 2;
+    google.internal.cloud.code.v1internal.RetrieveUserQuotaResponse.TokenType token_type = 3;
+    string model_id = 4;
+  }
+
+  repeated google.internal.cloud.code.v1internal.RetrieveUserQuotaResponse.BucketInfo buckets = 1;
+}
+
+service PredictionService {
+  rpc GenerateContent(google.internal.cloud.code.v1internal.GenerateContentRequest) returns (google.internal.cloud.code.v1internal.GenerateContentResponse);
+  rpc StreamGenerateContent(google.internal.cloud.code.v1internal.GenerateContentRequest) returns (stream google.internal.cloud.code.v1internal.GenerateContentResponse);
+  rpc CountTokens(google.internal.cloud.code.v1internal.CountTokensRequest) returns (google.internal.cloud.code.v1internal.CountTokensResponse);
+  rpc RetrieveUserQuota(google.internal.cloud.code.v1internal.RetrieveUserQuotaRequest) returns (google.internal.cloud.code.v1internal.RetrieveUserQuotaResponse);
+  rpc FetchAvailableModels(google.internal.cloud.code.v1internal.FetchAvailableModelsRequest) returns (google.internal.cloud.code.v1internal.FetchAvailableModelsResponse);
+}

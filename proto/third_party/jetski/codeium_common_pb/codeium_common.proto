@@ -1,0 +1,23 @@
+syntax = "proto3";
+package exa.codeium_common_pb;
+option go_package = "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/stubs/codeium";
+
+enum Model {
+  MODEL_UNSPECIFIED = 0;
+}
+
+enum APIProvider {
+  API_PROVIDER_UNSPECIFIED = 0;
+}
+
+enum ModelProvider {
+  MODEL_PROVIDER_UNSPECIFIED = 0;
+}
+
+enum PromptTemplaterType {
+  PROMPT_TEMPLATER_TYPE_UNSPECIFIED = 0;
+}
+
+enum ToolFormatterType {
+  TOOL_FORMATTER_TYPE_UNSPECIFIED = 0;
+}

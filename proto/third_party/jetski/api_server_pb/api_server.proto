@@ -1,0 +1,11 @@
+syntax = "proto3";
+package exa.api_server_pb;
+option go_package = "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/stubs/apiserver";
+
+message GetChatMessageRequest {
+  bytes data = 1;
+}
+
+message GetChatMessageResponse {
+  bytes data = 1;
+}

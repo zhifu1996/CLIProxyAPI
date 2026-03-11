@@ -1,0 +1,82 @@
+syntax = "proto3";
+package google.internal.cloud.code.v1internal;
+option go_package = "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/v1internal";
+
+import "google/protobuf/timestamp.proto";
+import "third_party/jetski/codeium_common_pb/codeium_common.proto";
+
+message FetchAvailableModelsRequest {
+  string project = 1;
+}
+
+message QuotaInfo {
+  float remaining_fraction = 1;
+  google.protobuf.Timestamp reset_time = 2;
+}
+
+message ModelDetails {
+  string display_name = 1;
+  bool supports_images = 2;
+  bool supports_thinking = 3;
+  int32 thinking_budget = 4;
+  int32 min_thinking_budget = 5;
+  bool recommended = 6;
+  int32 max_tokens = 7;
+  int32 max_output_tokens = 8;
+  string tokenizer_type = 9;
+  google.internal.cloud.code.v1internal.QuotaInfo quota_info = 10;
+  string beta_warning_message = 11;
+  bool beta = 12;
+  bool disabled = 13;
+  string description = 14;
+  exa.codeium_common_pb.Model model = 15;
+  exa.codeium_common_pb.APIProvider api_provider = 16;
+  exa.codeium_common_pb.ModelProvider model_provider = 17;
+  bool supports_cumulative_context = 18;
+  bool tab_jump_print_line_range = 19;
+  bool supports_estimate_token_counter = 20;
+  bool is_internal = 21;
+  bool add_cursor_to_find_replace_target = 22;
+  exa.codeium_common_pb.PromptTemplaterType prompt_templater_type = 23;
+  exa.codeium_common_pb.ToolFormatterType tool_formatter_type = 24;
+  bool supports_raw_thinking = 25;
+  bool supports_video = 26;
+  bool supports_pdf = 27;
+  bool requires_lead_in_generation = 28;
+  string tag_title = 29;
+  string tag_description = 30;
+  bool requires_no_xml_tool_examples = 31;
+  map<string, bool> supported_mime_types = 32;
+  bool requires_image_output_outside_function_responses = 33;
+  bool preview = 34;
+  int32 thinking_level = 35;
+}
+
+message ModelSort {
+  string display_name = 1;
+  repeated google.internal.cloud.code.v1internal.ModelGroup groups = 2;
+}
+
+message ModelGroup {
+  string display_name = 1;
+  repeated string model_ids = 2;
+}
+
+message DeprecatedModelReroutingInfo {
+  string new_model_id = 1;
+  exa.codeium_common_pb.Model old_model_enum = 2;
+  exa.codeium_common_pb.Model new_model_enum = 3;
+}
+
+message FetchAvailableModelsResponse {
+  map<string, google.internal.cloud.code.v1internal.ModelDetails> models = 1;
+  string default_agent_model_id = 2;
+  repeated google.internal.cloud.code.v1internal.ModelSort agent_model_sorts = 3;
+  repeated string command_model_ids = 4;
+  repeated string tab_model_ids = 5;
+  repeated string image_generation_model_ids = 6;
+  repeated string mquery_model_ids = 7;
+  repeated string web_search_model_ids = 8;
+  map<string, google.internal.cloud.code.v1internal.DeprecatedModelReroutingInfo> deprecated_model_ids = 9;
+  repeated string commit_message_model_ids = 10;
+}
