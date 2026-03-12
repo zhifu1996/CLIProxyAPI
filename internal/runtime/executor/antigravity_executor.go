@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -17,8 +16,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"runtime"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +36,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+	"golang.org/x/net/http2"
 	"google.golang.org/grpc/status"
 )
 
@@ -147,58 +147,108 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
-// antigravityUtlsRT is a singleton uTLS-backed HTTP/1.1 round tripper shared
+// antigravityUtlsRT is a singleton uTLS-backed HTTP/2 round tripper shared
 // by all Antigravity REST requests. It makes the TLS ClientHello look like
-// Chrome/BoringSSL while negotiating only HTTP/1.1.
+// Chrome/BoringSSL while supporting HTTP/2 (required by Google API endpoints).
 var (
 	antigravityUtlsRT     *antigravityUtlsRoundTripper
 	antigravityUtlsRTOnce sync.Once
 )
 
-// antigravityUtlsRoundTripper wraps a standard http.Transport but intercepts
-// DialTLSContext to perform the TLS handshake with uTLS HelloChrome_Auto,
-// giving a Chrome-like JA3/JA4 fingerprint while keeping HTTP/1.1 semantics.
+// antigravityUtlsRoundTripper uses uTLS with Chrome fingerprint over HTTP/2.
+// It manages a pool of http2.ClientConn per host, similar to the Claude uTLS transport.
 type antigravityUtlsRoundTripper struct {
-	base *http.Transport
+	mu          sync.Mutex
+	connections map[string]*http2.ClientConn
+	pending     map[string]*sync.Cond
 }
 
 func newAntigravityUtlsRoundTripper() *antigravityUtlsRoundTripper {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		base = &http.Transport{}
+	return &antigravityUtlsRoundTripper{
+		connections: make(map[string]*http2.ClientConn),
+		pending:     make(map[string]*sync.Cond),
 	}
-	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = false
-	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
-	clone.TLSClientConfig = nil // we handle TLS ourselves
-	clone.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil {
-			host = addr
-		}
-		dialer := &net.Dialer{}
-		rawConn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		// Negotiate HTTP/1.1 only — matching the real Antigravity REST client.
-		// Google's API endpoints support HTTP/1.1 on the same port.
-		cfg := &utls.Config{ServerName: host, NextProtos: []string{"http/1.1"}}
-		tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("utls handshake %s: %w", addr, err)
-		}
-		return tlsConn, nil
+}
+
+func (rt *antigravityUtlsRoundTripper) getOrCreateConn(hostname, addr string) (*http2.ClientConn, error) {
+	rt.mu.Lock()
+
+	if h2c, ok := rt.connections[hostname]; ok && h2c.CanTakeNewRequest() {
+		rt.mu.Unlock()
+		return h2c, nil
 	}
-	return &antigravityUtlsRoundTripper{base: clone}
+
+	if cond, ok := rt.pending[hostname]; ok {
+		cond.Wait()
+		if h2c, ok := rt.connections[hostname]; ok && h2c.CanTakeNewRequest() {
+			rt.mu.Unlock()
+			return h2c, nil
+		}
+	}
+
+	cond := sync.NewCond(&rt.mu)
+	rt.pending[hostname] = cond
+	rt.mu.Unlock()
+
+	h2c, err := rt.dialH2(hostname, addr)
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	delete(rt.pending, hostname)
+	cond.Broadcast()
+
+	if err != nil {
+		return nil, err
+	}
+	rt.connections[hostname] = h2c
+	return h2c, nil
+}
+
+func (rt *antigravityUtlsRoundTripper) dialH2(hostname, addr string) (*http2.ClientConn, error) {
+	rawConn, err := net.DialTimeout("tcp", addr, 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	cfg := &utls.Config{ServerName: hostname}
+	tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
+	if err := tlsConn.Handshake(); err != nil {
+		rawConn.Close()
+		return nil, fmt.Errorf("utls handshake %s: %w", addr, err)
+	}
+	tr := &http2.Transport{}
+	h2c, err := tr.NewClientConn(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+	return h2c, nil
 }
 
 func (rt *antigravityUtlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	return rt.base.RoundTrip(req)
+	host := req.URL.Host
+	addr := host
+	if !strings.Contains(addr, ":") {
+		addr += ":443"
+	}
+	hostname := req.URL.Hostname()
+
+	h2c, err := rt.getOrCreateConn(hostname, addr)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := h2c.RoundTrip(req)
+	if err != nil {
+		rt.mu.Lock()
+		if cached, ok := rt.connections[hostname]; ok && cached == h2c {
+			delete(rt.connections, hostname)
+		}
+		rt.mu.Unlock()
+		return nil, err
+	}
+	return resp, nil
 }
 
-// initAntigravityTransport creates the shared uTLS HTTP/1.1 round tripper exactly once.
+// initAntigravityTransport creates the shared uTLS HTTP/2 round tripper exactly once.
 func initAntigravityTransport() {
 	antigravityUtlsRT = newAntigravityUtlsRoundTripper()
 }
