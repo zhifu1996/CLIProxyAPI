@@ -1550,8 +1550,10 @@ func (e *AntigravityExecutor) refreshToken(ctx context.Context, auth *cliproxyau
 	// Real Antigravity uses Go's default User-Agent for OAuth token refresh
 	httpReq.Header.Set("User-Agent", "Go-http-client/2.0")
 
-	httpClient := newAntigravityHTTPClient(ctx, e.cfg, auth, 0)
-	httpResp, errDo := httpClient.Do(httpReq)
+	// Use standard HTTP client for OAuth2 token refresh — not the uTLS/HTTP-1.1
+	// transport used for API calls. Google's OAuth2 endpoint requires HTTP/2.
+	oauthClient := &http.Client{Timeout: 15 * time.Second}
+	httpResp, errDo := oauthClient.Do(httpReq)
 	if errDo != nil {
 		return auth, errDo
 	}
