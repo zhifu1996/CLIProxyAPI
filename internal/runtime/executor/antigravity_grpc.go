@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"unsafe"
 
 	utls "github.com/refraction-networking/utls"
 	pb "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/v1internal"
@@ -53,10 +52,23 @@ func (c *utlsTransportCredentials) ClientHandshake(ctx context.Context, authorit
 		return nil, nil, ctx.Err()
 	}
 
-	// utls.ConnectionState and crypto/tls.ConnectionState are layout-identical;
-	// convert via unsafe to satisfy the credentials.TLSInfo type.
+	// Manually convert utls.ConnectionState to crypto/tls.ConnectionState.
+	// unsafe.Pointer cast is not safe across utls/stdlib versions.
 	uState := tlsConn.ConnectionState()
-	stdState := *(*stdtls.ConnectionState)(unsafe.Pointer(&uState))
+	stdState := stdtls.ConnectionState{
+		Version:                     uState.Version,
+		HandshakeComplete:           uState.HandshakeComplete,
+		DidResume:                   uState.DidResume,
+		CipherSuite:                 uState.CipherSuite,
+		NegotiatedProtocol:          uState.NegotiatedProtocol,
+		NegotiatedProtocolIsMutual:  uState.NegotiatedProtocolIsMutual,
+		ServerName:                  uState.ServerName,
+		PeerCertificates:            uState.PeerCertificates,
+		VerifiedChains:              uState.VerifiedChains,
+		SignedCertificateTimestamps: uState.SignedCertificateTimestamps,
+		OCSPResponse:                uState.OCSPResponse,
+		TLSUnique:                   uState.TLSUnique,
+	}
 	return tlsConn, credentials.TLSInfo{State: stdState}, nil
 }
 
