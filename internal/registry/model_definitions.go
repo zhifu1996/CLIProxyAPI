@@ -3,7 +3,6 @@
 package registry
 
 import (
-	"sort"
 	"strings"
 )
 
@@ -28,7 +27,7 @@ type staticModelsJSON struct {
 	Qwen        []*ModelInfo                       `json:"qwen"`
 	IFlow       []*ModelInfo                       `json:"iflow"`
 	Kimi        []*ModelInfo                       `json:"kimi"`
-	Antigravity map[string]*AntigravityModelConfig `json:"antigravity"`
+	Antigravity []*ModelInfo `json:"antigravity"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -91,33 +90,30 @@ func GetKimiModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Kimi)
 }
 
-// GetAntigravityModelConfig returns static configuration for antigravity models.
-// Keys use upstream model names returned by the Antigravity models endpoint.
-func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
-	data := getModels()
-	if len(data.Antigravity) == 0 {
-		return nil
-	}
-	out := make(map[string]*AntigravityModelConfig, len(data.Antigravity))
-	for k, v := range data.Antigravity {
-		out[k] = cloneAntigravityModelConfig(v)
-	}
-	return out
+// GetAntigravityModels returns the static antigravity model definitions.
+func GetAntigravityModels() []*ModelInfo {
+	return cloneModelInfos(getModels().Antigravity)
 }
 
-func cloneAntigravityModelConfig(cfg *AntigravityModelConfig) *AntigravityModelConfig {
-	if cfg == nil {
+// GetAntigravityModelConfig returns static configuration for antigravity models
+// as a map keyed by model ID, for backward compatibility with callers that
+// need to look up Thinking/MaxCompletionTokens overrides by name.
+func GetAntigravityModelConfig() map[string]*AntigravityModelConfig {
+	models := getModels().Antigravity
+	if len(models) == 0 {
 		return nil
 	}
-	copyConfig := *cfg
-	if cfg.Thinking != nil {
-		copyThinking := *cfg.Thinking
-		if len(cfg.Thinking.Levels) > 0 {
-			copyThinking.Levels = append([]string(nil), cfg.Thinking.Levels...)
+	out := make(map[string]*AntigravityModelConfig, len(models))
+	for _, m := range models {
+		if m == nil || m.ID == "" {
+			continue
 		}
-		copyConfig.Thinking = &copyThinking
+		out[m.ID] = &AntigravityModelConfig{
+			Thinking:            m.Thinking,
+			MaxCompletionTokens: m.MaxCompletionTokens,
+		}
 	}
-	return &copyConfig
+	return out
 }
 
 // cloneModelInfos returns a shallow copy of the slice with each element deep-cloned.
@@ -168,28 +164,7 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	case "kimi":
 		return GetKimiModels()
 	case "antigravity":
-		cfg := GetAntigravityModelConfig()
-		if len(cfg) == 0 {
-			return nil
-		}
-		models := make([]*ModelInfo, 0, len(cfg))
-		for modelID, entry := range cfg {
-			if modelID == "" || entry == nil {
-				continue
-			}
-			models = append(models, &ModelInfo{
-				ID:                  modelID,
-				Object:              "model",
-				OwnedBy:             "antigravity",
-				Type:                "antigravity",
-				Thinking:            entry.Thinking,
-				MaxCompletionTokens: entry.MaxCompletionTokens,
-			})
-		}
-		sort.Slice(models, func(i, j int) bool {
-			return strings.ToLower(models[i].ID) < strings.ToLower(models[j].ID)
-		})
-		return models
+		return GetAntigravityModels()
 	default:
 		return nil
 	}
@@ -213,21 +188,13 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Qwen,
 		data.IFlow,
 		data.Kimi,
+		data.Antigravity,
 	}
 	for _, models := range allModels {
 		for _, m := range models {
 			if m != nil && m.ID == modelID {
 				return cloneModelInfo(m)
 			}
-		}
-	}
-
-	// Check Antigravity static config
-	if cfg := cloneAntigravityModelConfig(data.Antigravity[modelID]); cfg != nil {
-		return &ModelInfo{
-			ID:                  modelID,
-			Thinking:            cfg.Thinking,
-			MaxCompletionTokens: cfg.MaxCompletionTokens,
 		}
 	}
 
