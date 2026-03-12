@@ -2,15 +2,80 @@ package executor
 
 import (
 	"context"
-	"crypto/tls"
+	stdtls "crypto/tls"
+	"fmt"
+	"net"
 	"sync"
+	"unsafe"
 
+	utls "github.com/refraction-networking/utls"
 	pb "github.com/router-for-me/CLIProxyAPI/v6/internal/proto/v1internal"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 )
+
+// utlsTransportCredentials implements credentials.TransportCredentials using uTLS
+// to make the gRPC TLS ClientHello look like Chrome/BoringSSL.
+type utlsTransportCredentials struct {
+	serverName string
+}
+
+func newUtlsTransportCredentials() credentials.TransportCredentials {
+	return &utlsTransportCredentials{}
+}
+
+func (c *utlsTransportCredentials) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	host, _, err := net.SplitHostPort(authority)
+	if err != nil {
+		host = authority
+	}
+	serverName := c.serverName
+	if serverName == "" {
+		serverName = host
+	}
+
+	cfg := &utls.Config{ServerName: serverName}
+	tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- tlsConn.Handshake() }()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			tlsConn.Close()
+			return nil, nil, fmt.Errorf("utls handshake: %w", err)
+		}
+	case <-ctx.Done():
+		tlsConn.Close()
+		return nil, nil, ctx.Err()
+	}
+
+	// utls.ConnectionState and crypto/tls.ConnectionState are layout-identical;
+	// convert via unsafe to satisfy the credentials.TLSInfo type.
+	uState := tlsConn.ConnectionState()
+	stdState := *(*stdtls.ConnectionState)(unsafe.Pointer(&uState))
+	return tlsConn, credentials.TLSInfo{State: stdState}, nil
+}
+
+func (c *utlsTransportCredentials) ServerHandshake(net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return nil, nil, fmt.Errorf("utlsTransportCredentials: server handshake not supported")
+}
+
+func (c *utlsTransportCredentials) Info() credentials.ProtocolInfo {
+	return credentials.ProtocolInfo{SecurityProtocol: "tls"}
+}
+
+func (c *utlsTransportCredentials) Clone() credentials.TransportCredentials {
+	return &utlsTransportCredentials{serverName: c.serverName}
+}
+
+func (c *utlsTransportCredentials) OverrideServerName(name string) error {
+	c.serverName = name
+	return nil
+}
 
 // antigravityGRPCPool manages reusable gRPC connections keyed by target host.
 type antigravityGRPCPool struct {
@@ -41,7 +106,7 @@ func (p *antigravityGRPCPool) getOrCreate(target, token, userAgent string) (pb.C
 
 	conn, err := grpc.NewClient(
 		target,
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})),
+		grpc.WithTransportCredentials(newUtlsTransportCredentials()),
 		grpc.WithUserAgent(userAgent),
 	)
 	if err != nil {

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"runtime"
 	"net/url"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	utls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -145,59 +147,72 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
-// antigravityTransport is a singleton HTTP/1.1 transport shared by all Antigravity requests.
-// It is initialized once via antigravityTransportOnce to avoid leaking a new connection pool
-// (and the goroutines managing it) on every request.
+// antigravityUtlsRT is a singleton uTLS-backed HTTP/1.1 round tripper shared
+// by all Antigravity REST requests. It makes the TLS ClientHello look like
+// Chrome/BoringSSL while negotiating only HTTP/1.1.
 var (
-	antigravityTransport     *http.Transport
-	antigravityTransportOnce sync.Once
+	antigravityUtlsRT     *antigravityUtlsRoundTripper
+	antigravityUtlsRTOnce sync.Once
 )
 
-func cloneTransportWithHTTP11(base *http.Transport) *http.Transport {
-	if base == nil {
-		return nil
-	}
-
-	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = false
-	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
-	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
-	if clone.TLSClientConfig == nil {
-		clone.TLSClientConfig = &tls.Config{}
-	} else {
-		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
-	}
-	// Actively advertise only HTTP/1.1 in the ALPN handshake.
-	clone.TLSClientConfig.NextProtos = []string{"http/1.1"}
-	return clone
+// antigravityUtlsRoundTripper wraps a standard http.Transport but intercepts
+// DialTLSContext to perform the TLS handshake with uTLS HelloChrome_Auto,
+// giving a Chrome-like JA3/JA4 fingerprint while keeping HTTP/1.1 semantics.
+type antigravityUtlsRoundTripper struct {
+	base *http.Transport
 }
 
-// initAntigravityTransport creates the shared HTTP/1.1 transport exactly once.
-func initAntigravityTransport() {
+func newAntigravityUtlsRoundTripper() *antigravityUtlsRoundTripper {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		base = &http.Transport{}
 	}
-	antigravityTransport = cloneTransportWithHTTP11(base)
+	clone := base.Clone()
+	clone.ForceAttemptHTTP2 = false
+	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	clone.TLSClientConfig = nil // we handle TLS ourselves
+	clone.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		dialer := &net.Dialer{}
+		rawConn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		cfg := &utls.Config{ServerName: host, NextProtos: []string{"http/1.1"}}
+		tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	}
+	return &antigravityUtlsRoundTripper{base: clone}
+}
+
+func (rt *antigravityUtlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return rt.base.RoundTrip(req)
+}
+
+// initAntigravityTransport creates the shared uTLS HTTP/1.1 round tripper exactly once.
+func initAntigravityTransport() {
+	antigravityUtlsRT = newAntigravityUtlsRoundTripper()
 }
 
 // newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
-// enforcing HTTP/1.1 by disabling HTTP/2 to perfectly mimic Node.js https defaults.
-// The underlying Transport is a singleton to avoid leaking connection pools.
+// using uTLS with Chrome fingerprint and enforcing HTTP/1.1 to mimic the real client.
 func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	antigravityTransportOnce.Do(initAntigravityTransport)
+	antigravityUtlsRTOnce.Do(initAntigravityTransport)
 
 	client := newProxyAwareHTTPClient(ctx, cfg, auth, timeout)
-	// If no transport is set, use the shared HTTP/1.1 transport.
+	// If no custom transport from proxy, use the shared uTLS round tripper.
 	if client.Transport == nil {
-		client.Transport = antigravityTransport
-		return client
+		client.Transport = antigravityUtlsRT
 	}
-
-	// Preserve proxy settings from proxy-aware transports while forcing HTTP/1.1.
-	if transport, ok := client.Transport.(*http.Transport); ok {
-		client.Transport = cloneTransportWithHTTP11(transport)
-	}
+	// When a proxy transport is set, we keep it as-is — proxy transports
+	// handle their own TLS. In the future this could be layered with uTLS too.
 	return client
 }
 
@@ -671,6 +686,7 @@ func (e *AntigravityExecutor) executeClaudeNonStreamGRPC(ctx context.Context, au
 		reporter.ensurePublished(ctx)
 
 		log.Debugf("antigravity executor: using gRPC GenerateChat via %s", target)
+		sendTelemetryAfterChat(ctx, auth, token, projectID, ua, 0)
 		return cliproxyexecutor.Response{Payload: []byte(converted)}, nil
 	}
 
@@ -954,6 +970,7 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 		}
 
 		out := make(chan cliproxyexecutor.StreamChunk)
+		streamStartedAt := time.Now()
 		go func() {
 			defer close(out)
 			var param any
@@ -998,6 +1015,7 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(tail[i])}
 			}
 			reporter.ensurePublished(ctx)
+			sendTelemetryAfterChat(ctx, auth, token, projectID, ua, time.Since(streamStartedAt))
 		}()
 
 		log.Debugf("antigravity executor: using gRPC StreamGenerateChat via %s", target)
