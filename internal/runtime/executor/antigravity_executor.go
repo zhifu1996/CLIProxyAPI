@@ -181,11 +181,13 @@ func newAntigravityUtlsRoundTripper() *antigravityUtlsRoundTripper {
 		if err != nil {
 			return nil, err
 		}
+		// Negotiate HTTP/1.1 only — matching the real Antigravity REST client.
+		// Google's API endpoints support HTTP/1.1 on the same port.
 		cfg := &utls.Config{ServerName: host, NextProtos: []string{"http/1.1"}}
 		tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			rawConn.Close()
-			return nil, err
+			return nil, fmt.Errorf("utls handshake %s: %w", addr, err)
 		}
 		return tlsConn, nil
 	}
@@ -1387,7 +1389,7 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 				return fallbackAntigravityPrimaryModels()
 			}
 			if idx+1 < len(baseURLs) {
-				log.Debugf("antigravity executor: models request error on base url %s, retrying with fallback base url: %s", baseURL, baseURLs[idx+1])
+				log.Debugf("antigravity executor: models request error on base url %s: %v, retrying with fallback base url: %s", baseURL, errDo, baseURLs[idx+1])
 				continue
 			}
 			return fallbackAntigravityPrimaryModels()
@@ -1906,7 +1908,7 @@ func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
 	return []string{
 		antigravityBaseURLDaily,
 		antigravitySandboxBaseURLDaily,
-		// antigravityBaseURLProd,
+		antigravityBaseURLProd,
 	}
 }
 
