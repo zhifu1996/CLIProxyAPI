@@ -744,6 +744,10 @@ func (e *AntigravityExecutor) executeClaudeNonStreamGRPC(ctx context.Context, au
 		converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, jsonPayload, &param)
 		reporter.ensurePublished(ctx)
 
+		if len(converted) == 0 {
+			log.Debugf("antigravity executor: gRPC GenerateChat translated to empty payload from %s, trying next", target)
+			continue
+		}
 		log.Debugf("antigravity executor: using gRPC GenerateChat via %s (payload=%d bytes)", target, len(converted))
 		sendTelemetryAfterChat(ctx, auth, token, projectID, ua, 0)
 		return cliproxyexecutor.Response{Payload: []byte(converted)}, nil
