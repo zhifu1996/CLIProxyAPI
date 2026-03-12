@@ -995,12 +995,16 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 
 	// Wrap translated payload with antigravity fields (model, project, requestId, etc.)
 	wrappedPayload := geminiToAntigravity(baseModel, translated, projectID)
+	log.Debugf("antigravity executor: wrappedPayload (stream): %s", string(wrappedPayload))
 
 	// Convert JSON to GenerateChatRequest protobuf
 	chatReq, errConvert := jsonToGenerateChatRequest(baseModel, wrappedPayload, projectID, auth)
 	if errConvert != nil {
 		return nil, fmt.Errorf("antigravity executor: convert to GenerateChatRequest: %w", errConvert)
 	}
+
+	log.Debugf("antigravity executor: StreamGenerateChat request: project=%q model_config_id=%v user_message=%q history_len=%d func_decls=%d",
+		chatReq.Project, chatReq.ModelConfigId, chatReq.UserMessage, len(chatReq.History), len(chatReq.FunctionDeclarations))
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	ua := resolveUserAgent(auth)
