@@ -727,7 +727,14 @@ func (e *AntigravityExecutor) executeClaudeNonStreamGRPC(ctx context.Context, au
 
 		jsonPayload, errJSON := generateChatResponseToJSON(chatResp)
 		if errJSON != nil {
-			return cliproxyexecutor.Response{}, fmt.Errorf("antigravity executor: gRPC response to JSON: %w", errJSON)
+			log.Debugf("antigravity executor: gRPC GenerateChat response to JSON error: %v", errJSON)
+			continue
+		}
+
+		// Check if gRPC returned an empty/useless response — fall back to REST.
+		if chatResp.Markdown == "" && len(chatResp.FunctionCalls) == 0 {
+			log.Debugf("antigravity executor: gRPC GenerateChat returned empty response from %s, trying next", target)
+			continue
 		}
 
 		appendAPIResponseChunk(ctx, e.cfg, jsonPayload)
@@ -737,7 +744,7 @@ func (e *AntigravityExecutor) executeClaudeNonStreamGRPC(ctx context.Context, au
 		converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, jsonPayload, &param)
 		reporter.ensurePublished(ctx)
 
-		log.Debugf("antigravity executor: using gRPC GenerateChat via %s", target)
+		log.Debugf("antigravity executor: using gRPC GenerateChat via %s (payload=%d bytes)", target, len(converted))
 		sendTelemetryAfterChat(ctx, auth, token, projectID, ua, 0)
 		return cliproxyexecutor.Response{Payload: []byte(converted)}, nil
 	}
@@ -1003,8 +1010,8 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 		return nil, fmt.Errorf("antigravity executor: convert to GenerateChatRequest: %w", errConvert)
 	}
 
-	log.Debugf("antigravity executor: StreamGenerateChat request: project=%q model_config_id=%v user_message=%q history_len=%d func_decls=%d",
-		chatReq.Project, chatReq.ModelConfigId, chatReq.UserMessage, len(chatReq.History), len(chatReq.FunctionDeclarations))
+	log.Debugf("antigravity executor: StreamGenerateChat request: project=%q request_id=%q model_config_id=%v user_message=%q history_len=%d func_decls=%d metadata=%+v",
+		chatReq.Project, chatReq.RequestId, chatReq.ModelConfigId, chatReq.UserMessage, len(chatReq.History), len(chatReq.FunctionDeclarations), chatReq.Metadata)
 
 	baseURLs := antigravityBaseURLFallbackOrder(auth)
 	ua := resolveUserAgent(auth)
@@ -1025,11 +1032,33 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 			continue
 		}
 
+		// Read the first chunk synchronously to detect immediate errors
+		// (e.g. InvalidArgument) before committing to gRPC — enables REST fallback.
+		firstResp, firstErr := stream.Recv()
+		if firstErr != nil {
+			if st, ok := status.FromError(firstErr); ok {
+				log.Debugf("antigravity executor: gRPC first recv error for %s: code=%s msg=%s", target, st.Code(), st.Message())
+			} else {
+				log.Debugf("antigravity executor: gRPC first recv error for %s: %v", target, firstErr)
+			}
+			continue
+		}
+
 		out := make(chan cliproxyexecutor.StreamChunk)
 		streamStartedAt := time.Now()
 		go func() {
 			defer close(out)
 			var param any
+
+			// Process the first response that was already received
+			if jsonPayload, errJSON := generateChatResponseToJSON(firstResp); errJSON == nil {
+				appendAPIResponseChunk(ctx, e.cfg, jsonPayload)
+				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(jsonPayload), &param)
+				for i := range chunks {
+					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				}
+			}
+
 			for {
 				resp, errRecv := stream.Recv()
 				if errRecv == io.EOF {
@@ -1040,7 +1069,6 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 						out <- cliproxyexecutor.StreamChunk{Err: errRecv}
 						return
 					}
-					// Map gRPC status to HTTP error
 					if st, ok := status.FromError(errRecv); ok {
 						log.Debugf("antigravity executor: gRPC recv error: code=%s msg=%s", st.Code(), st.Message())
 					}
@@ -1050,7 +1078,6 @@ func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *clipr
 					return
 				}
 
-				// Convert protobuf response to JSON for existing translator pipeline
 				jsonPayload, errJSON := generateChatResponseToJSON(resp)
 				if errJSON != nil {
 					log.Debugf("antigravity executor: gRPC response to JSON error: %v", errJSON)
