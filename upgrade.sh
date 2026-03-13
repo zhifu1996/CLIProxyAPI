@@ -25,7 +25,7 @@ DOCKER_RUN_OPTS=(
 )
 
 # Upstream remote (original repo)
-UPSTREAM_REMOTE="origin"
+UPSTREAM_REMOTE="upstream"
 UPSTREAM_BRANCH="main"
 
 # Backup
