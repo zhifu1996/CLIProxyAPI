@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # CLIProxyAPI Fork Upgrade Script
-# Syncs upstream, rebases custom commits, rebuilds Docker image, and restarts.
+# Reset to upstream, re-apply custom files + patches, rebuild Docker image, restart.
 # Usage: ./upgrade.sh
 #
 
@@ -32,6 +32,9 @@ UPSTREAM_BRANCH="main"
 BACKUP_DIR="$PROJECT_DIR/backups"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
+# Stash dir for custom files during upgrade
+STASH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/cliproxy-upgrade.XXXXXX")
+
 # Management API password (for usage export/import)
 if [ -z "${MANAGEMENT_PASSWORD:-}" ] && [ -f "$PROJECT_DIR/.env" ]; then
     MANAGEMENT_PASSWORD=$(grep -E "^MANAGEMENT_PASSWORD=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
@@ -47,16 +50,22 @@ log()  { echo -e "${GREEN}[OK]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!!]${NC} $*"; }
 err()  { echo -e "${RED}[ERR]${NC} $*"; }
 
+cleanup() {
+    rm -rf "$STASH_DIR"
+}
+trap cleanup EXIT
+
 # --- Main ---
 cd "$PROJECT_DIR"
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}   CLIProxyAPI Fork Upgrade${NC}"
+echo -e "${GREEN}   (reset + patch mode)${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 
 # Step 1: Backup
-echo -e "${YELLOW}[1/6] Backup...${NC}"
+echo -e "${YELLOW}[1/7] Backup...${NC}"
 BACKUP_PATH="$BACKUP_DIR/backup_$TIMESTAMP"
 mkdir -p "$BACKUP_PATH"
 [ -f config.yaml ] && cp config.yaml "$BACKUP_PATH/" && echo "  config.yaml"
@@ -65,7 +74,7 @@ log "Saved to $BACKUP_PATH"
 echo ""
 
 # Step 2: Export usage stats
-echo -e "${YELLOW}[2/6] Export usage stats...${NC}"
+echo -e "${YELLOW}[2/7] Export usage stats...${NC}"
 USAGE_BACKUP=""
 if [ -n "${MANAGEMENT_PASSWORD:-}" ]; then
     USAGE_BACKUP="$BACKUP_PATH/usage_stats.json"
@@ -81,55 +90,114 @@ else
 fi
 echo ""
 
-# Step 3: Fetch upstream & rebase
-echo -e "${YELLOW}[3/6] Sync upstream ($UPSTREAM_REMOTE/$UPSTREAM_BRANCH)...${NC}"
+# Step 3: Fetch upstream & stash custom files
+echo -e "${YELLOW}[3/7] Fetch upstream & stash custom files...${NC}"
 git fetch "$UPSTREAM_REMOTE" "$UPSTREAM_BRANCH"
 
 UPSTREAM_HEAD=$(git rev-parse "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
-MERGE_BASE=$(git merge-base HEAD "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
 
-if [ "$UPSTREAM_HEAD" = "$MERGE_BASE" ]; then
-    log "Already up to date with upstream"
-    echo ""
-    echo -ne "${YELLOW}Rebuild anyway? [y/N]: ${NC}"
-    read -r REBUILD
-    if [[ ! "$REBUILD" =~ ^[Yy]$ ]]; then
-        log "Nothing to do."
-        exit 0
+# Stash custom files (new files not in upstream) before reset
+echo "  Stashing custom files..."
+if [ -f patches/custom_files.txt ]; then
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        if [ -f "$f" ]; then
+            mkdir -p "$STASH_DIR/$(dirname "$f")"
+            cp "$f" "$STASH_DIR/$f"
+        fi
+    done < patches/custom_files.txt
+fi
+# Also stash patches dir itself, upgrade.sh
+mkdir -p "$STASH_DIR/patches"
+cp -r patches/* "$STASH_DIR/patches/" 2>/dev/null || true
+cp upgrade.sh "$STASH_DIR/upgrade.sh"
+log "Custom files stashed to $STASH_DIR"
+echo ""
+
+# Step 4: Reset to upstream & apply customizations
+echo -e "${YELLOW}[4/7] Reset to upstream & apply patches...${NC}"
+git reset --hard "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"
+log "Reset to $UPSTREAM_REMOTE/$UPSTREAM_BRANCH ($UPSTREAM_HEAD)"
+
+# Copy back custom files
+echo "  Restoring custom files..."
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if [ -f "$STASH_DIR/$f" ]; then
+        mkdir -p "$(dirname "$f")"
+        cp "$STASH_DIR/$f" "$f"
     fi
+done < "$STASH_DIR/patches/custom_files.txt"
+
+# Copy back patches dir and upgrade.sh
+cp -r "$STASH_DIR/patches" .
+cp "$STASH_DIR/upgrade.sh" upgrade.sh
+
+# Delete upstream files we don't want
+if [ -f patches/deleted_files.txt ]; then
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "$f" ] && rm -f "$f" && echo "  deleted: $f"
+    done < patches/deleted_files.txt
+fi
+
+# Apply the modification patch
+echo "  Applying fork_modifications.patch..."
+if git apply --check patches/fork_modifications.patch 2>/dev/null; then
+    git apply patches/fork_modifications.patch
+    log "Patch applied cleanly"
 else
-    BEHIND=$(git rev-list --count HEAD.."$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
-    log "Upstream has $BEHIND new commit(s), rebasing..."
-    if ! git rebase "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"; then
-        err "Rebase conflict! Resolve manually then re-run."
-        echo "  git rebase --continue   (after fixing conflicts)"
-        echo "  git rebase --abort      (to cancel)"
+    warn "Patch failed to apply cleanly. Trying with 3-way merge..."
+    if git apply --3way patches/fork_modifications.patch; then
+        log "Patch applied with 3-way merge (check for conflicts)"
+    else
+        err "Patch failed! Manual intervention required."
+        echo ""
+        echo "  The patch file is: patches/fork_modifications.patch"
+        echo "  After resolving, run:  go build ./..."
+        echo "  Then re-run upgrade.sh (it will skip the already-reset step)"
         exit 1
     fi
-    log "Rebase successful"
+fi
+
+# Update go dependencies
+echo "  Running go mod tidy..."
+go mod tidy 2>/dev/null || warn "go mod tidy had issues (may need manual fix)"
+echo ""
+
+# Verify build
+echo -e "${YELLOW}[5/7] Verify build...${NC}"
+if go build ./...; then
+    log "Build successful"
+else
+    err "Build failed! Fix errors then re-run."
+    exit 1
 fi
 echo ""
 
-# Step 4: Stop container
-echo -e "${YELLOW}[4/6] Stop container...${NC}"
+# Commit all customizations as a single commit
+git add -A
+git commit -m "feat: apply fork customizations (uTLS, gRPC, telemetry)" --allow-empty 2>/dev/null || true
+log "Committed customizations"
+echo ""
+
+# Step 6: Stop, rebuild & start
+echo -e "${YELLOW}[6/7] Stop container, rebuild & start...${NC}"
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     docker stop "$CONTAINER_NAME" 2>/dev/null || true
     docker rm "$CONTAINER_NAME" 2>/dev/null || true
     log "Container stopped"
 else
-    warn "Container not found, skipping"
+    warn "Container not found, skipping stop"
 fi
-echo ""
 
-# Step 5: Build & start
-echo -e "${YELLOW}[5/6] Build image & start container...${NC}"
 docker build -t "$IMAGE_NAME" "$PROJECT_DIR"
 docker run "${DOCKER_RUN_OPTS[@]}" "$IMAGE_NAME"
 log "Container started"
 echo ""
 
-# Step 6: Restore usage stats
-echo -e "${YELLOW}[6/6] Restore usage stats...${NC}"
+# Step 7: Restore usage stats
+echo -e "${YELLOW}[7/7] Restore usage stats...${NC}"
 if [ -n "$USAGE_BACKUP" ] && [ -f "$USAGE_BACKUP" ]; then
     sleep 5
     for i in 1 2 3; do

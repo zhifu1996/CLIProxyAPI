@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -24,7 +23,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	utls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -36,8 +34,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
-	"golang.org/x/net/http2"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -147,114 +143,8 @@ func NewAntigravityExecutor(cfg *config.Config) *AntigravityExecutor {
 	return &AntigravityExecutor{cfg: cfg}
 }
 
-// antigravityUtlsRT is a singleton uTLS-backed HTTP/2 round tripper shared
-// by all Antigravity REST requests. It makes the TLS ClientHello look like
-// Chrome/BoringSSL while supporting HTTP/2 (required by Google API endpoints).
-var (
-	antigravityUtlsRT     *antigravityUtlsRoundTripper
-	antigravityUtlsRTOnce sync.Once
-)
-
-// antigravityUtlsRoundTripper uses uTLS with Chrome fingerprint over HTTP/2.
-// It manages a pool of http2.ClientConn per host, similar to the Claude uTLS transport.
-type antigravityUtlsRoundTripper struct {
-	mu          sync.Mutex
-	connections map[string]*http2.ClientConn
-	pending     map[string]*sync.Cond
-}
-
-func newAntigravityUtlsRoundTripper() *antigravityUtlsRoundTripper {
-	return &antigravityUtlsRoundTripper{
-		connections: make(map[string]*http2.ClientConn),
-		pending:     make(map[string]*sync.Cond),
-	}
-}
-
-func (rt *antigravityUtlsRoundTripper) getOrCreateConn(hostname, addr string) (*http2.ClientConn, error) {
-	rt.mu.Lock()
-
-	if h2c, ok := rt.connections[hostname]; ok && h2c.CanTakeNewRequest() {
-		rt.mu.Unlock()
-		return h2c, nil
-	}
-
-	if cond, ok := rt.pending[hostname]; ok {
-		cond.Wait()
-		if h2c, ok := rt.connections[hostname]; ok && h2c.CanTakeNewRequest() {
-			rt.mu.Unlock()
-			return h2c, nil
-		}
-	}
-
-	cond := sync.NewCond(&rt.mu)
-	rt.pending[hostname] = cond
-	rt.mu.Unlock()
-
-	h2c, err := rt.dialH2(hostname, addr)
-
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	delete(rt.pending, hostname)
-	cond.Broadcast()
-
-	if err != nil {
-		return nil, err
-	}
-	rt.connections[hostname] = h2c
-	return h2c, nil
-}
-
-func (rt *antigravityUtlsRoundTripper) dialH2(hostname, addr string) (*http2.ClientConn, error) {
-	rawConn, err := net.DialTimeout("tcp", addr, 15*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	cfg := &utls.Config{ServerName: hostname}
-	tlsConn := utls.UClient(rawConn, cfg, utls.HelloChrome_Auto)
-	if err := tlsConn.Handshake(); err != nil {
-		rawConn.Close()
-		return nil, fmt.Errorf("utls handshake %s: %w", addr, err)
-	}
-	tr := &http2.Transport{}
-	h2c, err := tr.NewClientConn(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, err
-	}
-	return h2c, nil
-}
-
-func (rt *antigravityUtlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	host := req.URL.Host
-	addr := host
-	if !strings.Contains(addr, ":") {
-		addr += ":443"
-	}
-	hostname := req.URL.Hostname()
-
-	h2c, err := rt.getOrCreateConn(hostname, addr)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := h2c.RoundTrip(req)
-	if err != nil {
-		rt.mu.Lock()
-		if cached, ok := rt.connections[hostname]; ok && cached == h2c {
-			delete(rt.connections, hostname)
-		}
-		rt.mu.Unlock()
-		return nil, err
-	}
-	return resp, nil
-}
-
-// initAntigravityTransport creates the shared uTLS HTTP/2 round tripper exactly once.
-func initAntigravityTransport() {
-	antigravityUtlsRT = newAntigravityUtlsRoundTripper()
-}
-
 // newAntigravityHTTPClient creates an HTTP client specifically for Antigravity,
-// using uTLS with Chrome fingerprint and enforcing HTTP/1.1 to mimic the real client.
+// using uTLS with Chrome fingerprint and enforcing HTTP/2 to mimic the real client.
 func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	antigravityUtlsRTOnce.Do(initAntigravityTransport)
 
@@ -685,77 +575,6 @@ attemptLoop:
 	return resp, err
 }
 
-// executeClaudeNonStreamGRPC performs a non-streaming request via gRPC GenerateChat.
-func (e *AntigravityExecutor) executeClaudeNonStreamGRPC(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options,
-	baseModel, token string, translated []byte, reporter *usageReporter, from, to sdktranslator.Format) (cliproxyexecutor.Response, error) {
-
-	projectID := ""
-	if auth != nil && auth.Metadata != nil {
-		if pid, ok := auth.Metadata["project_id"].(string); ok {
-			projectID = strings.TrimSpace(pid)
-		}
-	}
-	if projectID == "" {
-		projectID = generateProjectID()
-	}
-
-	wrappedPayload := geminiToAntigravity(baseModel, translated, projectID)
-
-	chatReq, errConvert := jsonToGenerateChatRequest(baseModel, wrappedPayload, projectID, auth)
-	if errConvert != nil {
-		return cliproxyexecutor.Response{}, fmt.Errorf("antigravity executor: convert to GenerateChatRequest: %w", errConvert)
-	}
-
-	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	ua := resolveUserAgent(auth)
-
-	for _, baseURL := range baseURLs {
-		target := grpcTargetFromBaseURL(baseURL)
-
-		client, _, errConn := grpcPool.getOrCreate(target, token, ua)
-		if errConn != nil {
-			log.Debugf("antigravity executor: gRPC dial error for %s: %v", target, errConn)
-			continue
-		}
-
-		grpcCtx := grpcOutgoingMetadata(ctx, token, ua)
-		chatResp, errCall := client.GenerateChat(grpcCtx, chatReq)
-		if errCall != nil {
-			log.Debugf("antigravity executor: gRPC GenerateChat error for %s: %v", target, errCall)
-			continue
-		}
-
-		jsonPayload, errJSON := generateChatResponseToJSON(chatResp)
-		if errJSON != nil {
-			log.Debugf("antigravity executor: gRPC GenerateChat response to JSON error: %v", errJSON)
-			continue
-		}
-
-		// Check if gRPC returned an empty/useless response — fall back to REST.
-		if chatResp.Markdown == "" && len(chatResp.FunctionCalls) == 0 {
-			log.Debugf("antigravity executor: gRPC GenerateChat returned empty response from %s, trying next", target)
-			continue
-		}
-
-		appendAPIResponseChunk(ctx, e.cfg, jsonPayload)
-		reporter.publish(ctx, parseAntigravityUsage(jsonPayload))
-
-		var param any
-		converted := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, jsonPayload, &param)
-		reporter.ensurePublished(ctx)
-
-		if len(converted) == 0 {
-			log.Debugf("antigravity executor: gRPC GenerateChat translated to empty payload from %s, trying next", target)
-			continue
-		}
-		log.Debugf("antigravity executor: using gRPC GenerateChat via %s (payload=%d bytes)", target, len(converted))
-		sendTelemetryAfterChat(ctx, auth, token, projectID, ua, 0)
-		return cliproxyexecutor.Response{Payload: []byte(converted)}, nil
-	}
-
-	return cliproxyexecutor.Response{}, fmt.Errorf("antigravity executor: all gRPC endpoints failed")
-}
-
 func (e *AntigravityExecutor) convertStreamToNonStream(stream []byte) []byte {
 	responseTemplate := ""
 	var traceID string
@@ -987,129 +806,6 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 	// Fallback to REST/SSE
 	return e.executeStreamREST(ctx, auth, req, opts, baseModel, token, translated, reporter, from, to)
-}
-
-// executeStreamGRPC performs streaming via gRPC StreamGenerateChat.
-func (e *AntigravityExecutor) executeStreamGRPC(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options,
-	baseModel, token string, translated []byte, reporter *usageReporter, from, to sdktranslator.Format) (*cliproxyexecutor.StreamResult, error) {
-
-	// Extract project ID
-	projectID := ""
-	if auth != nil && auth.Metadata != nil {
-		if pid, ok := auth.Metadata["project_id"].(string); ok {
-			projectID = strings.TrimSpace(pid)
-		}
-	}
-	if projectID == "" {
-		projectID = generateProjectID()
-	}
-
-	// Wrap translated payload with antigravity fields (model, project, requestId, etc.)
-	wrappedPayload := geminiToAntigravity(baseModel, translated, projectID)
-	log.Debugf("antigravity executor: wrappedPayload (stream): %s", string(wrappedPayload))
-
-	// Convert JSON to GenerateChatRequest protobuf
-	chatReq, errConvert := jsonToGenerateChatRequest(baseModel, wrappedPayload, projectID, auth)
-	if errConvert != nil {
-		return nil, fmt.Errorf("antigravity executor: convert to GenerateChatRequest: %w", errConvert)
-	}
-
-	log.Debugf("antigravity executor: StreamGenerateChat request: project=%q request_id=%q model_config_id=%v user_message=%q history_len=%d func_decls=%d metadata=%+v",
-		chatReq.Project, chatReq.RequestId, chatReq.ModelConfigId, chatReq.UserMessage, len(chatReq.History), len(chatReq.FunctionDeclarations), chatReq.Metadata)
-
-	baseURLs := antigravityBaseURLFallbackOrder(auth)
-	ua := resolveUserAgent(auth)
-
-	for _, baseURL := range baseURLs {
-		target := grpcTargetFromBaseURL(baseURL)
-
-		client, _, errConn := grpcPool.getOrCreate(target, token, ua)
-		if errConn != nil {
-			log.Debugf("antigravity executor: gRPC dial error for %s: %v", target, errConn)
-			continue
-		}
-
-		grpcCtx := grpcOutgoingMetadata(ctx, token, ua)
-		stream, errStream := client.StreamGenerateChat(grpcCtx, chatReq)
-		if errStream != nil {
-			log.Debugf("antigravity executor: gRPC StreamGenerateChat error for %s: %v", target, errStream)
-			continue
-		}
-
-		// Read the first chunk synchronously to detect immediate errors
-		// (e.g. InvalidArgument) before committing to gRPC — enables REST fallback.
-		firstResp, firstErr := stream.Recv()
-		if firstErr != nil {
-			if st, ok := status.FromError(firstErr); ok {
-				log.Debugf("antigravity executor: gRPC first recv error for %s: code=%s msg=%s", target, st.Code(), st.Message())
-			} else {
-				log.Debugf("antigravity executor: gRPC first recv error for %s: %v", target, firstErr)
-			}
-			continue
-		}
-
-		out := make(chan cliproxyexecutor.StreamChunk)
-		streamStartedAt := time.Now()
-		go func() {
-			defer close(out)
-			var param any
-
-			// Process the first response that was already received
-			if jsonPayload, errJSON := generateChatResponseToJSON(firstResp); errJSON == nil {
-				appendAPIResponseChunk(ctx, e.cfg, jsonPayload)
-				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(jsonPayload), &param)
-				for i := range chunks {
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
-				}
-			}
-
-			for {
-				resp, errRecv := stream.Recv()
-				if errRecv == io.EOF {
-					break
-				}
-				if errRecv != nil {
-					if errors.Is(errRecv, context.Canceled) || errors.Is(errRecv, context.DeadlineExceeded) {
-						out <- cliproxyexecutor.StreamChunk{Err: errRecv}
-						return
-					}
-					if st, ok := status.FromError(errRecv); ok {
-						log.Debugf("antigravity executor: gRPC recv error: code=%s msg=%s", st.Code(), st.Message())
-					}
-					recordAPIResponseError(ctx, e.cfg, errRecv)
-					reporter.publishFailure(ctx)
-					out <- cliproxyexecutor.StreamChunk{Err: errRecv}
-					return
-				}
-
-				jsonPayload, errJSON := generateChatResponseToJSON(resp)
-				if errJSON != nil {
-					log.Debugf("antigravity executor: gRPC response to JSON error: %v", errJSON)
-					continue
-				}
-
-				appendAPIResponseChunk(ctx, e.cfg, jsonPayload)
-
-				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, bytes.Clone(jsonPayload), &param)
-				for i := range chunks {
-					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
-				}
-			}
-			// Send [DONE] signal
-			var param2 any
-			tail := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, translated, []byte("[DONE]"), &param2)
-			for i := range tail {
-				out <- cliproxyexecutor.StreamChunk{Payload: []byte(tail[i])}
-			}
-			reporter.ensurePublished(ctx)
-			sendTelemetryAfterChat(ctx, auth, token, projectID, ua, time.Since(streamStartedAt))
-		}()
-
-		log.Debugf("antigravity executor: using gRPC StreamGenerateChat via %s", target)
-		return &cliproxyexecutor.StreamResult{Chunks: out}, nil
-	}
-
-	return nil, fmt.Errorf("antigravity executor: all gRPC endpoints failed")
 }
 
 // executeStreamREST performs streaming via REST/SSE (legacy fallback).
@@ -1344,7 +1040,7 @@ func (e *AntigravityExecutor) CountTokens(ctx context.Context, auth *cliproxyaut
 		if errReq != nil {
 			return cliproxyexecutor.Response{}, errReq
 		}
-	
+
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -1460,7 +1156,7 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		if errReq != nil {
 			return fallbackAntigravityPrimaryModels()
 		}
-	
+
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 		httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
