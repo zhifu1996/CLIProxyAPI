@@ -30,6 +30,21 @@ UPSTREAM_BRANCH="main"
 BACKUP_DIR="$PROJECT_DIR/backups"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
+# Fork-only files: conflicts in these always keep ours (fork wins)
+FORK_FILES=(
+    "internal/runtime/executor/antigravity_utls.go"
+    "internal/runtime/executor/antigravity_grpc.go"
+    "internal/runtime/executor/antigravity_grpc_executor.go"
+    "internal/runtime/executor/antigravity_telemetry.go"
+    "internal/runtime/executor/antigravity_chat_translator.go"
+    "internal/runtime/executor/antigravity_executor.go"
+    "internal/proto/"
+    "internal/registry/model_definitions.go"
+    "internal/registry/model_updater.go"
+    "proto/"
+    "upgrade.sh"
+)
+
 if [ -z "${MANAGEMENT_PASSWORD:-}" ] && [ -f "$PROJECT_DIR/.env" ]; then
     MANAGEMENT_PASSWORD=$(grep -E "^MANAGEMENT_PASSWORD=" "$PROJECT_DIR/.env" 2>/dev/null | cut -d'=' -f2- | tr -d '"' | tr -d "'" || true)
 fi
@@ -104,31 +119,104 @@ else
         warn "Merge conflict in $CONFLICT_COUNT file(s):"
         echo "$CONFLICTS" | sed 's/^/  /'
         echo ""
-        echo -e "  ${GREEN}o${NC}) Keep ${GREEN}ours${NC} — preserve fork changes, discard upstream for conflicting files"
-        echo -e "  ${YELLOW}t${NC}) Keep ${YELLOW}theirs${NC} — accept upstream changes, discard fork for conflicting files"
-        echo -e "  ${RED}a${NC}) Abort merge and exit"
-        echo ""
-        echo -ne "${YELLOW}Choose [o/t/a]: ${NC}"
-        read -r CHOICE
-        case "$CHOICE" in
-            o|O)
-                echo "$CONFLICTS" | xargs git checkout --ours --
-                echo "$CONFLICTS" | xargs git add --
-                GIT_EDITOR=true git merge --continue
-                log "Merge resolved (kept ours)"
-                ;;
-            t|T)
-                echo "$CONFLICTS" | xargs git checkout --theirs --
-                echo "$CONFLICTS" | xargs git add --
-                GIT_EDITOR=true git merge --continue
-                log "Merge resolved (kept theirs)"
-                ;;
-            *)
-                git merge --abort
-                log "Merge aborted."
-                exit 1
-                ;;
-        esac
+
+        # Classify conflicts: fork files auto-resolve with ours, rest need decision
+        AUTO_OURS=""
+        MANUAL=""
+        while IFS= read -r file; do
+            is_fork=false
+            for pattern in "${FORK_FILES[@]}"; do
+                # Pattern ending with / matches prefix (directory), otherwise exact match
+                if [[ "$pattern" == */ && "$file" == "$pattern"* ]] || [[ "$file" == "$pattern" ]]; then
+                    is_fork=true
+                    break
+                fi
+            done
+            if $is_fork; then
+                AUTO_OURS+="$file"$'\n'
+            else
+                MANUAL+="$file"$'\n'
+            fi
+        done <<< "$CONFLICTS"
+        AUTO_OURS="${AUTO_OURS%$'\n'}"
+        MANUAL="${MANUAL%$'\n'}"
+
+        # Auto-resolve fork files
+        if [ -n "$AUTO_OURS" ]; then
+            log "Auto-resolving fork files (keep ours):"
+            echo "$AUTO_OURS" | sed 's/^/  /'
+            echo "$AUTO_OURS" | xargs git checkout --ours --
+            echo "$AUTO_OURS" | xargs git add --
+        fi
+
+        # Handle remaining conflicts
+        if [ -n "$MANUAL" ]; then
+            MANUAL_COUNT=$(echo "$MANUAL" | wc -l)
+            echo ""
+            warn "$MANUAL_COUNT file(s) still need resolution:"
+            echo "$MANUAL" | sed 's/^/  /'
+            echo ""
+            echo -e "  ${GREEN}o${NC}) Keep ${GREEN}ours${NC} for all remaining"
+            echo -e "  ${YELLOW}t${NC}) Keep ${YELLOW}theirs${NC} for all remaining"
+            echo -e "  ${RED}p${NC}) Per-file — choose for each file individually"
+            echo -e "  ${RED}a${NC}) Abort merge and exit"
+            echo ""
+            echo -ne "${YELLOW}Choose [o/t/p/a]: ${NC}"
+            read -r CHOICE
+            case "$CHOICE" in
+                o|O)
+                    echo "$MANUAL" | xargs git checkout --ours --
+                    echo "$MANUAL" | xargs git add --
+                    ;;
+                t|T)
+                    echo "$MANUAL" | xargs git checkout --theirs --
+                    echo "$MANUAL" | xargs git add --
+                    ;;
+                p|P)
+                    while IFS= read -r file; do
+                        echo ""
+                        echo -e "  ${YELLOW}$file${NC}"
+                        echo -ne "    [o]urs / [t]heirs / [s]kip (manual later): "
+                        read -r PER_CHOICE
+                        case "$PER_CHOICE" in
+                            o|O)
+                                git checkout --ours -- "$file"
+                                git add -- "$file"
+                                log "  → kept ours"
+                                ;;
+                            t|T)
+                                git checkout --theirs -- "$file"
+                                git add -- "$file"
+                                log "  → kept theirs"
+                                ;;
+                            *)
+                                warn "  → skipped (resolve manually before continuing)"
+                                ;;
+                        esac
+                    done <<< "$MANUAL"
+
+                    # Check if any unresolved conflicts remain
+                    REMAINING=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+                    if [ -n "$REMAINING" ]; then
+                        err "Unresolved conflicts remain:"
+                        echo "$REMAINING" | sed 's/^/  /'
+                        echo ""
+                        echo "Resolve them manually, then run:"
+                        echo "  git add <files> && git merge --continue"
+                        echo "  Then re-run: ./upgrade.sh"
+                        exit 1
+                    fi
+                    ;;
+                *)
+                    git merge --abort
+                    log "Merge aborted."
+                    exit 1
+                    ;;
+            esac
+        fi
+
+        GIT_EDITOR=true git merge --continue
+        log "Merge resolved"
     else
         log "Merge successful (no conflicts)"
     fi
