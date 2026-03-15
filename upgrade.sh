@@ -7,6 +7,8 @@
 
 set -euo pipefail
 
+export PATH="$PATH:/usr/local/go/bin:$HOME/go/bin"
+
 # --- Config ---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
