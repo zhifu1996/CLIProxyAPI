@@ -1,6 +1,0 @@
-cmd/fetch_antigravity_models/main.go
-internal/config/codex_websocket_header_defaults_test.go
-internal/runtime/executor/proxy_helpers_test.go
-sdk/cliproxy/rtprovider_test.go
-sdk/proxyutil/proxy.go
-sdk/proxyutil/proxy_test.go
