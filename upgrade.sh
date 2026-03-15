@@ -97,17 +97,39 @@ else
     BEHIND=$(git rev-list --count HEAD.."$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")
     log "Upstream has $BEHIND new commit(s), merging..."
     if ! git merge "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" -m "merge: upstream $UPSTREAM_BRANCH"; then
-        err "Merge conflict! Resolve manually, then re-run."
+        CONFLICTS=$(git diff --name-only --diff-filter=U)
+        CONFLICT_COUNT=$(echo "$CONFLICTS" | wc -l)
+        warn "Merge conflict in $CONFLICT_COUNT file(s):"
+        echo "$CONFLICTS" | sed 's/^/  /'
         echo ""
-        echo "  Fix conflicts, then:"
-        echo "    git add -A && git merge --continue"
-        echo "    ./upgrade.sh   # re-run to build & deploy"
+        echo -e "  ${GREEN}o${NC}) Keep ${GREEN}ours${NC} — preserve fork changes, discard upstream for conflicting files"
+        echo -e "  ${YELLOW}t${NC}) Keep ${YELLOW}theirs${NC} — accept upstream changes, discard fork for conflicting files"
+        echo -e "  ${RED}a${NC}) Abort merge and exit"
         echo ""
-        echo "  Or abort:"
-        echo "    git merge --abort"
-        exit 1
+        echo -ne "${YELLOW}Choose [o/t/a]: ${NC}"
+        read -r CHOICE
+        case "$CHOICE" in
+            o|O)
+                echo "$CONFLICTS" | xargs git checkout --ours --
+                echo "$CONFLICTS" | xargs git add --
+                GIT_EDITOR=true git merge --continue
+                log "Merge resolved (kept ours)"
+                ;;
+            t|T)
+                echo "$CONFLICTS" | xargs git checkout --theirs --
+                echo "$CONFLICTS" | xargs git add --
+                GIT_EDITOR=true git merge --continue
+                log "Merge resolved (kept theirs)"
+                ;;
+            *)
+                git merge --abort
+                log "Merge aborted."
+                exit 1
+                ;;
+        esac
+    else
+        log "Merge successful (no conflicts)"
     fi
-    log "Merge successful"
 
     # Verify build after merge
     echo "  Verifying build..."
