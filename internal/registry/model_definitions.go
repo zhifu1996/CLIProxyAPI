@@ -141,7 +141,7 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 //   - qwen
 //   - iflow
 //   - kimi
-//   - antigravity (returns static overrides only)
+//   - antigravity
 func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	key := strings.ToLower(strings.TrimSpace(channel))
 	switch key {
